@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+youtube-transcript-api==1.0.3
+yt-dlp
+boto3==1.35.90
+pydantic==2.10.4
