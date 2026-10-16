@@ -1,9 +1,13 @@
 import hmac
+import json
 import os
 import re
 import subprocess
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from urllib.parse import parse_qs, urlparse
 
@@ -56,9 +60,8 @@ def video_id_from_url(url: str) -> str:
     return vid
 
 
-@app.post("/transcript", dependencies=[Depends(require_token)])
-def transcript(body: TranscriptIn):
-    vid = video_id_from_url(body.url)
+def transcript_native(vid: str) -> dict:
+    """Direct YouTube caption fetch (often blocked from datacenter IPs)."""
     try:
         fetched = YouTubeTranscriptApi().fetch(vid, languages=["en"])
     except Exception as e:
@@ -73,6 +76,49 @@ def transcript(body: TranscriptIn):
         if s.text.strip()
     ]
     return {"videoId": vid, "language": fetched.language_code, "segments": segments}
+
+
+def transcript_supadata(vid: str) -> dict:
+    """Interim provider: Supadata free tier. mode=native = existing captions only (1 credit)."""
+    key = os.getenv("SUPADATA_API_KEY", "")
+    if not key:
+        raise HTTPException(status_code=500, detail="SUPADATA_API_KEY not set")
+    q = urllib.parse.urlencode(
+        {"url": f"https://www.youtube.com/watch?v={vid}", "mode": "native"}
+    )
+    req = urllib.request.Request(
+        f"https://api.supadata.ai/v1/transcript?{q}", headers={"x-api-key": key}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300].decode("utf-8", "replace")
+        code = 422 if e.code in (400, 404) else 502
+        raise HTTPException(status_code=code, detail=f"supadata {e.code}: {body}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"supadata request failed: {type(e).__name__}")
+    content = data.get("content")
+    if not isinstance(content, list):
+        raise HTTPException(status_code=502, detail="supadata returned no transcript content")
+    segments = []
+    for c in content:
+        text = " ".join(str(c.get("text", "")).split())
+        if not text:
+            continue
+        start = float(c.get("offset", 0)) / 1000.0
+        end = start + float(c.get("duration", 0)) / 1000.0
+        segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+    return {"videoId": vid, "language": data.get("lang"), "segments": segments}
+
+
+@app.post("/transcript", dependencies=[Depends(require_token)])
+def transcript(body: TranscriptIn):
+    vid = video_id_from_url(body.url)
+    provider = os.getenv("TRANSCRIPT_PROVIDER", "native").lower()
+    if provider == "supadata":
+        return transcript_supadata(vid)
+    return transcript_native(vid)
 
 
 # ---------- render ----------
@@ -94,7 +140,10 @@ def resolve_stream_urls(source_url: str) -> list[str]:
     )
     urls = [l for l in r.stdout.splitlines() if l.startswith("http")]
     if r.returncode != 0 or not urls:
-        raise HTTPException(status_code=422, detail="could not resolve source stream")
+        raise HTTPException(
+            status_code=422,
+            detail=f"could not resolve source stream: {r.stderr.strip()[-200:]}",
+        )
     return urls[:2]
 
 
