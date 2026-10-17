@@ -2,9 +2,11 @@ import json
 import os
 import random
 import re
+import shlex
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,11 +55,17 @@ def proxy_pool() -> list[str]:
     return [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 
 
+def render_backend() -> str:
+    # RENDER_BACKEND=rendi (default, hosted FFmpeg) or local (FFmpeg inside this container)
+    return os.getenv("RENDER_BACKEND", "rendi").lower()
+
+
 # ---------- health ----------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "renderBackend": render_backend(),
         "proxies": len(proxy_pool()),
         "uaMode": os.getenv("UA_MODE", "legacy"),
         "cookies": bool(os.getenv("YOUTUBE_COOKIES")),
@@ -163,14 +171,20 @@ def _short_error(stderr: str) -> str:
     return msg[:140]
 
 
-def resolve_stream_urls(source_url: str, workdir: str):
-    """YouTube pages -> direct stream URL(s) via yt-dlp (nothing downloaded).
+def is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").removeprefix("www.")
+    return host == "youtu.be" or host.endswith("youtube.com")
 
-    Returns (urls, proxy, user_agent). Googlevideo URLs are tied to the IP that
-    resolved them, so FFmpeg must fetch through the same proxy + user agent.
+
+def resolve_stream_urls(source_url: str, workdir: str):
+    """Returns (urls, proxy, user_agent).
+
+    Non-YouTube URLs (direct media files) are used as-is. YouTube pages are
+    resolved to direct stream URL(s) via yt-dlp (nothing is downloaded). Those
+    URLs are tied to the IP that resolved them, so a local FFmpeg must fetch
+    through the same proxy + user agent.
     """
-    host = (urlparse(source_url).hostname or "").removeprefix("www.")
-    if not (host == "youtu.be" or host.endswith("youtube.com")):
+    if not is_youtube(source_url):
         return [source_url], None, None
 
     cookies_path = None
@@ -218,6 +232,74 @@ def r2_client():
     )
 
 
+def ffmpeg_args(inputs: list, start: float, duration: float, vf: str, out_name: str, input_opts: list | None = None) -> list:
+    """FFmpeg arguments (no binary name), shared by both backends.
+
+    inputs / out_name are file paths, URLs or Rendi {{placeholders}}.
+    input_opts are extra options placed before every -i (e.g. proxy, user agent).
+    """
+    args = []
+    for name in inputs:
+        args += list(input_opts or []) + ["-ss", str(start), "-i", name]
+    args += ["-t", str(duration), "-map", "0:v:0", "-map", f"{len(inputs) - 1}:a:0?",
+             "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", out_name]
+    return args
+
+
+# ----- Rendi (hosted FFmpeg) -----
+RENDI_BASE = "https://api.rendi.dev/v1"
+
+
+def rendi_call(method: str, path: str, payload: dict | None = None) -> dict:
+    key = os.getenv("RENDI_API_KEY", "")
+    if not key:
+        raise HTTPException(status_code=500, detail="RENDI_API_KEY not set")
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        f"{RENDI_BASE}{path}", data=data, method=method,
+        headers={"X-API-KEY": key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read()[:400].decode("utf-8", "replace")
+        raise HTTPException(status_code=502, detail=f"rendi {e.code}: {body}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"rendi request failed: {type(e).__name__}")
+
+
+def render_with_rendi(streams: list, start: float, duration: float, vf: str, out_path: str) -> str:
+    """Runs the trim/crop/scale on Rendi, downloads the result to out_path, returns the command id."""
+    in_files = {f"in_{i + 1}": s for i, s in enumerate(streams)}
+    placeholders = [f"{{{{in_{i + 1}}}}}" for i in range(len(streams))]
+    args = ffmpeg_args(placeholders, start, duration, vf, "{{out_1}}")
+    sub = rendi_call("POST", "/run-ffmpeg-command", {
+        "input_files": in_files,
+        "output_files": {"out_1": "clip.mp4"},
+        "ffmpeg_command": shlex.join(args),
+    })
+    cid = sub.get("command_id")
+    if not cid:
+        raise HTTPException(status_code=502, detail=f"rendi gave no command_id: {str(sub)[:200]}")
+    deadline = time.time() + float(os.getenv("RENDI_TIMEOUT", "240"))
+    while time.time() < deadline:
+        time.sleep(2)
+        st = rendi_call("GET", f"/commands/{cid}")
+        status = str(st.get("status", "")).upper()
+        if status == "SUCCESS":
+            url = ((st.get("output_files") or {}).get("out_1") or {}).get("storage_url")
+            if not url:
+                raise HTTPException(status_code=502, detail="rendi finished without an output URL")
+            urllib.request.urlretrieve(url, out_path)
+            return cid
+        if status in ("FAILED", "ERROR"):
+            raise HTTPException(status_code=502, detail=f"rendi command failed: {str(st)[:500]}")
+    raise HTTPException(status_code=504, detail=f"rendi command {cid} still running after timeout")
+
+
 @app.post("/render")
 def render(body: RenderIn):
     m = re.fullmatch(r"(\d{3,4})x(\d{3,4})", body.format)
@@ -229,27 +311,29 @@ def render(body: RenderIn):
         raise HTTPException(status_code=400, detail=f"clip length must be 0-{MAX_CLIP_SECONDS:.0f}s")
 
     vf = f"crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',scale={w}:{h},setsar=1"
+    backend = render_backend()
+    rendi_id = None
 
     with _render_slots, tempfile.TemporaryDirectory(prefix="render-") as tmp:
         streams, proxy, ua = resolve_stream_urls(body.sourceUrl, tmp)
         out = os.path.join(tmp, "clip.mp4")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-        for s in streams:
+
+        if backend == "rendi":
+            rendi_id = render_with_rendi(streams, body.start, duration, vf, out)
+        else:
+            opts = []
             if ua:
-                cmd += ["-user_agent", ua]
+                opts += ["-user_agent", ua]
             if proxy:
-                cmd += ["-http_proxy", proxy]
-            cmd += ["-ss", str(body.start), "-i", s]
-        cmd += ["-t", str(duration), "-map", "0:v:0", "-map", f"{len(streams) - 1}:a:0?",
-                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", out]
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="render timed out")
-        if p.returncode != 0 or not os.path.exists(out):
-            raise HTTPException(status_code=500, detail=f"ffmpeg failed: {p.stderr[-300:]}")
+                opts += ["-http_proxy", proxy]
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+            cmd += ffmpeg_args(streams, body.start, duration, vf, out, input_opts=opts)
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            except subprocess.TimeoutExpired:
+                raise HTTPException(status_code=504, detail="render timed out")
+            if p.returncode != 0 or not os.path.exists(out):
+                raise HTTPException(status_code=500, detail=f"ffmpeg failed: {p.stderr[-300:]}")
 
         size = os.path.getsize(out)
         key = f"clips/{uuid.uuid4().hex}.mp4"
@@ -269,4 +353,6 @@ def render(body: RenderIn):
         "format": body.format,
         "start": body.start,
         "end": body.end,
+        "backend": backend,
+        "rendiCommandId": rendi_id,
     }
