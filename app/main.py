@@ -23,7 +23,7 @@ app = FastAPI(title="Clip Compute Plane")
 MAX_CLIP_SECONDS = float(os.getenv("MAX_CLIP_SECONDS", "180"))
 _render_slots = threading.Semaphore(int(os.getenv("RENDER_CONCURRENCY", "1")))
 
-USER_AGENTS = [
+LEGACY_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36",
     "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
     "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko",
@@ -36,6 +36,18 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
 ]
 
+MODERN_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+]
+
+
+def user_agents() -> list[str]:
+    # UA_MODE=legacy (default, the list you supplied) or UA_MODE=modern
+    return MODERN_USER_AGENTS if os.getenv("UA_MODE", "legacy").lower() == "modern" else LEGACY_USER_AGENTS
+
 
 def proxy_pool() -> list[str]:
     return [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
@@ -44,7 +56,12 @@ def proxy_pool() -> list[str]:
 # ---------- health ----------
 @app.get("/health")
 def health():
-    return {"status": "ok", "proxies": len(proxy_pool())}
+    return {
+        "status": "ok",
+        "proxies": len(proxy_pool()),
+        "uaMode": os.getenv("UA_MODE", "legacy"),
+        "cookies": bool(os.getenv("YOUTUBE_COOKIES")),
+    }
 
 
 # ---------- transcript ----------
@@ -139,7 +156,14 @@ class RenderIn(BaseModel):
     format: str = "1080x1920"
 
 
-def resolve_stream_urls(source_url: str):
+def _short_error(stderr: str) -> str:
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    errs = [l for l in lines if l.startswith("ERROR")]
+    msg = (errs[-1] if errs else (lines[-1] if lines else "no output"))
+    return msg[:140]
+
+
+def resolve_stream_urls(source_url: str, workdir: str):
     """YouTube pages -> direct stream URL(s) via yt-dlp (nothing downloaded).
 
     Returns (urls, proxy, user_agent). Googlevideo URLs are tied to the IP that
@@ -149,28 +173,37 @@ def resolve_stream_urls(source_url: str):
     if not (host == "youtu.be" or host.endswith("youtube.com")):
         return [source_url], None, None
 
+    cookies_path = None
+    cookies = os.getenv("YOUTUBE_COOKIES", "")
+    if cookies:
+        cookies_path = os.path.join(workdir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(cookies)
+
     pool = proxy_pool()
-    attempts = random.sample(pool, k=min(3, len(pool))) if pool else [None]
+    attempts = random.sample(pool, k=min(5, len(pool))) if pool else [None]
     errors = []
-    for proxy in attempts:
-        ua = random.choice(USER_AGENTS)
+    for i, proxy in enumerate(attempts, 1):
+        ua = random.choice(user_agents())
         cmd = ["yt-dlp", "-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-               "--no-playlist", "--user-agent", ua]
+               "--no-playlist", "--no-warnings", "--user-agent", ua]
         if proxy:
             cmd += ["--proxy", proxy]
-        cmd.append(source_url)
+        if cookies_path:
+            cmd += ["--cookies", cookies_path]
+        cmd += ["--", source_url]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         except subprocess.TimeoutExpired:
-            errors.append("yt-dlp timed out")
+            errors.append(f"#{i} timed out")
             continue
         urls = [l for l in r.stdout.splitlines() if l.startswith("http")]
         if r.returncode == 0 and urls:
             return urls[:2], proxy, ua
-        errors.append(r.stderr.strip()[-200:])
+        errors.append(f"#{i} {_short_error(r.stderr)}")
     raise HTTPException(
         status_code=422,
-        detail=f"could not resolve source stream after {len(attempts)} attempt(s): {errors[-1] if errors else ''}",
+        detail=f"could not resolve source stream ({len(attempts)} attempts): " + " | ".join(errors),
     )
 
 
@@ -195,10 +228,10 @@ def render(body: RenderIn):
     if duration <= 0 or duration > MAX_CLIP_SECONDS:
         raise HTTPException(status_code=400, detail=f"clip length must be 0-{MAX_CLIP_SECONDS:.0f}s")
 
-    streams, proxy, ua = resolve_stream_urls(body.sourceUrl)
     vf = f"crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',scale={w}:{h},setsar=1"
 
     with _render_slots, tempfile.TemporaryDirectory(prefix="render-") as tmp:
+        streams, proxy, ua = resolve_stream_urls(body.sourceUrl, tmp)
         out = os.path.join(tmp, "clip.mp4")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         for s in streams:
