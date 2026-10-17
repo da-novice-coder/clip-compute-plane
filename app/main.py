@@ -1,6 +1,6 @@
-import hmac
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -13,28 +13,38 @@ from urllib.parse import parse_qs, urlparse
 
 import boto3
 from botocore.config import Config
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 
+# NOTE: authentication is intentionally disabled for testing. Re-add before production.
 app = FastAPI(title="Clip Compute Plane")
 
 MAX_CLIP_SECONDS = float(os.getenv("MAX_CLIP_SECONDS", "180"))
 _render_slots = threading.Semaphore(int(os.getenv("RENDER_CONCURRENCY", "1")))
 
+USER_AGENTS = [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_5) AppleWebKit/600.8.9 (KHTML, like Gecko) Version/8.0.8 Safari/600.8.9",
+    "Mozilla/5.0 (iPad; CPU OS 8_4_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) Version/8.0 Mobile/12H321 Safari/600.1.4",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.10240",
+    "Mozilla/5.0 (Windows NT 6.3; WOW64; rv:40.0) Gecko/20100101 Firefox/40.0",
+]
 
-# ---------- auth ----------
-def require_token(authorization: str = Header(default="")):
-    expected = os.getenv("INTERNAL_SERVICE_TOKEN", "")
-    supplied = authorization.removeprefix("Bearer ").strip()
-    if not expected or not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=401, detail="unauthorized")
+
+def proxy_pool() -> list[str]:
+    return [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
 
 
 # ---------- health ----------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "proxies": len(proxy_pool())}
 
 
 # ---------- transcript ----------
@@ -112,7 +122,7 @@ def transcript_supadata(vid: str) -> dict:
     return {"videoId": vid, "language": data.get("lang"), "segments": segments}
 
 
-@app.post("/transcript", dependencies=[Depends(require_token)])
+@app.post("/transcript")
 def transcript(body: TranscriptIn):
     vid = video_id_from_url(body.url)
     provider = os.getenv("TRANSCRIPT_PROVIDER", "native").lower()
@@ -129,22 +139,39 @@ class RenderIn(BaseModel):
     format: str = "1080x1920"
 
 
-def resolve_stream_urls(source_url: str) -> list[str]:
-    """YouTube pages -> direct stream URL(s) via yt-dlp (nothing downloaded)."""
+def resolve_stream_urls(source_url: str):
+    """YouTube pages -> direct stream URL(s) via yt-dlp (nothing downloaded).
+
+    Returns (urls, proxy, user_agent). Googlevideo URLs are tied to the IP that
+    resolved them, so FFmpeg must fetch through the same proxy + user agent.
+    """
     host = (urlparse(source_url).hostname or "").removeprefix("www.")
     if not (host == "youtu.be" or host.endswith("youtube.com")):
-        return [source_url]
-    r = subprocess.run(
-        ["yt-dlp", "-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "--no-playlist", source_url],
-        capture_output=True, text=True, timeout=60,
+        return [source_url], None, None
+
+    pool = proxy_pool()
+    attempts = random.sample(pool, k=min(3, len(pool))) if pool else [None]
+    errors = []
+    for proxy in attempts:
+        ua = random.choice(USER_AGENTS)
+        cmd = ["yt-dlp", "-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+               "--no-playlist", "--user-agent", ua]
+        if proxy:
+            cmd += ["--proxy", proxy]
+        cmd.append(source_url)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            errors.append("yt-dlp timed out")
+            continue
+        urls = [l for l in r.stdout.splitlines() if l.startswith("http")]
+        if r.returncode == 0 and urls:
+            return urls[:2], proxy, ua
+        errors.append(r.stderr.strip()[-200:])
+    raise HTTPException(
+        status_code=422,
+        detail=f"could not resolve source stream after {len(attempts)} attempt(s): {errors[-1] if errors else ''}",
     )
-    urls = [l for l in r.stdout.splitlines() if l.startswith("http")]
-    if r.returncode != 0 or not urls:
-        raise HTTPException(
-            status_code=422,
-            detail=f"could not resolve source stream: {r.stderr.strip()[-200:]}",
-        )
-    return urls[:2]
 
 
 def r2_client():
@@ -158,7 +185,7 @@ def r2_client():
     )
 
 
-@app.post("/render", dependencies=[Depends(require_token)])
+@app.post("/render")
 def render(body: RenderIn):
     m = re.fullmatch(r"(\d{3,4})x(\d{3,4})", body.format)
     if not m:
@@ -168,13 +195,17 @@ def render(body: RenderIn):
     if duration <= 0 or duration > MAX_CLIP_SECONDS:
         raise HTTPException(status_code=400, detail=f"clip length must be 0-{MAX_CLIP_SECONDS:.0f}s")
 
-    streams = resolve_stream_urls(body.sourceUrl)
+    streams, proxy, ua = resolve_stream_urls(body.sourceUrl)
     vf = f"crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',scale={w}:{h},setsar=1"
 
     with _render_slots, tempfile.TemporaryDirectory(prefix="render-") as tmp:
         out = os.path.join(tmp, "clip.mp4")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         for s in streams:
+            if ua:
+                cmd += ["-user_agent", ua]
+            if proxy:
+                cmd += ["-http_proxy", proxy]
             cmd += ["-ss", str(body.start), "-i", s]
         cmd += ["-t", str(duration), "-map", "0:v:0", "-map", f"{len(streams) - 1}:a:0?",
                 "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
