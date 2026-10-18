@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import random
@@ -48,9 +49,14 @@ MODERN_USER_AGENTS = [
 ]
 
 
-def user_agents() -> list[str]:
-    # UA_MODE=legacy (default, the list you supplied) or UA_MODE=modern
-    return MODERN_USER_AGENTS if os.getenv("UA_MODE", "legacy").lower() == "modern" else LEGACY_USER_AGENTS
+def pick_user_agent() -> str | None:
+    # UA_MODE=off (default now: let yt-dlp use its own headers), legacy, or modern
+    mode = os.getenv("UA_MODE", "off").lower()
+    if mode == "legacy":
+        return random.choice(LEGACY_USER_AGENTS)
+    if mode == "modern":
+        return random.choice(MODERN_USER_AGENTS)
+    return None
 
 
 def proxy_pool() -> list[str]:
@@ -68,10 +74,46 @@ def health():
     return {
         "status": "ok",
         "renderBackend": render_backend(),
+        "transcriptProviders": os.getenv("TRANSCRIPT_PROVIDER", "native"),
         "proxies": len(proxy_pool()),
-        "uaMode": os.getenv("UA_MODE", "legacy"),
+        "uaMode": os.getenv("UA_MODE", "off"),
         "cookies": bool(os.getenv("YOUTUBE_COOKIES")),
     }
+
+
+# ---------- shared yt-dlp helpers ----------
+def _short_error(stderr: str) -> str:
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    errs = [l for l in lines if l.startswith("ERROR")]
+    msg = (errs[-1] if errs else (lines[-1] if lines else "no output"))
+    return msg[:140]
+
+
+def write_cookies(workdir: str) -> str | None:
+    cookies = os.getenv("YOUTUBE_COOKIES", "")
+    if not cookies:
+        return None
+    path = os.path.join(workdir, "cookies.txt")
+    with open(path, "w") as f:
+        f.write(cookies)
+    return path
+
+
+def ytdlp_attempts() -> list:
+    """Proxies to try, in random order (up to 5). [None] = no proxy configured."""
+    pool = proxy_pool()
+    return random.sample(pool, k=min(5, len(pool))) if pool else [None]
+
+
+def ytdlp_base(proxy: str | None, ua: str | None, cookies_path: str | None) -> list:
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings"]
+    if ua:
+        cmd += ["--user-agent", ua]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if cookies_path:
+        cmd += ["--cookies", cookies_path]
+    return cmd
 
 
 # ---------- transcript ----------
@@ -116,7 +158,7 @@ def transcript_native(vid: str) -> dict:
 
 
 def transcript_supadata(vid: str) -> dict:
-    """Interim provider: Supadata free tier. mode=native = existing captions only (1 credit)."""
+    """Supadata free tier. mode=native = existing captions only (1 credit)."""
     key = os.getenv("SUPADATA_API_KEY", "")
     if not key:
         raise HTTPException(status_code=500, detail="SUPADATA_API_KEY not set")
@@ -149,13 +191,76 @@ def transcript_supadata(vid: str) -> dict:
     return {"videoId": vid, "language": data.get("lang"), "segments": segments}
 
 
+def parse_json3(path: str) -> list:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    segments = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs")
+        if not segs or "tStartMs" not in ev:
+            continue
+        text = " ".join("".join(s.get("utf8", "") for s in segs).split())
+        if not text:
+            continue
+        start = ev["tStartMs"] / 1000.0
+        end = start + ev.get("dDurationMs", 0) / 1000.0
+        segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
+    return segments
+
+
+def transcript_ytdlp(vid: str) -> dict:
+    """Captions via yt-dlp (no video download) through the proxy pool."""
+    url = f"https://www.youtube.com/watch?v={vid}"
+    errors = []
+    with tempfile.TemporaryDirectory(prefix="subs-") as tmp:
+        cookies_path = write_cookies(tmp)
+        for i, proxy in enumerate(ytdlp_attempts(), 1):
+            cmd = ytdlp_base(proxy, pick_user_agent(), cookies_path)
+            cmd += ["--skip-download", "--write-subs", "--write-auto-subs",
+                    "--sub-langs", "en.*,en", "--sub-format", "json3",
+                    "-o", os.path.join(tmp, "%(id)s.%(ext)s"), "--", url]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                errors.append(f"#{i} timed out")
+                continue
+            files = sorted(glob.glob(os.path.join(tmp, "*.json3")))
+            if r.returncode == 0 and files:
+                segments = parse_json3(files[0])
+                if segments:
+                    return {"videoId": vid, "language": "en", "segments": segments}
+                errors.append(f"#{i} empty captions")
+                continue
+            errors.append(f"#{i} {_short_error(r.stderr)}" if r.returncode else f"#{i} no English captions found")
+    raise HTTPException(
+        status_code=422,
+        detail="yt-dlp captions failed: " + " | ".join(errors),
+    )
+
+
+PROVIDERS = {
+    "supadata": transcript_supadata,
+    "ytdlp": transcript_ytdlp,
+    "native": transcript_native,
+}
+
+
 @app.post("/transcript")
 def transcript(body: TranscriptIn):
     vid = video_id_from_url(body.url)
-    provider = os.getenv("TRANSCRIPT_PROVIDER", "native").lower()
-    if provider == "supadata":
-        return transcript_supadata(vid)
-    return transcript_native(vid)
+    # TRANSCRIPT_PROVIDER is an ordered, comma-separated fallback chain, e.g. "supadata,ytdlp"
+    names = [n.strip().lower() for n in os.getenv("TRANSCRIPT_PROVIDER", "native").split(",") if n.strip()]
+    errors = []
+    for name in names:
+        fn = PROVIDERS.get(name)
+        if not fn:
+            errors.append(f"{name}: unknown provider")
+            continue
+        try:
+            return fn(vid)
+        except HTTPException as e:
+            errors.append(f"{name}: {e.detail}")
+    raise HTTPException(status_code=422, detail=" || ".join(errors) or "no transcript provider configured")
 
 
 # ---------- render ----------
@@ -164,13 +269,6 @@ class RenderIn(BaseModel):
     start: float = Field(ge=0)
     end: float
     format: str = "1080x1920"
-
-
-def _short_error(stderr: str) -> str:
-    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
-    errs = [l for l in lines if l.startswith("ERROR")]
-    msg = (errs[-1] if errs else (lines[-1] if lines else "no output"))
-    return msg[:140]
 
 
 def is_youtube(url: str) -> bool:
@@ -184,30 +282,18 @@ def resolve_stream_urls(source_url: str, workdir: str):
     Non-YouTube URLs (direct media files) are used as-is. YouTube pages are
     resolved to direct stream URL(s) via yt-dlp (nothing is downloaded). Those
     URLs are tied to the IP that resolved them, so a local FFmpeg must fetch
-    through the same proxy + user agent.
+    through the same proxy (and user agent, if one is set).
     """
     if not is_youtube(source_url):
         return [source_url], None, None
 
-    cookies_path = None
-    cookies = os.getenv("YOUTUBE_COOKIES", "")
-    if cookies:
-        cookies_path = os.path.join(workdir, "cookies.txt")
-        with open(cookies_path, "w") as f:
-            f.write(cookies)
-
-    pool = proxy_pool()
-    attempts = random.sample(pool, k=min(5, len(pool))) if pool else [None]
+    cookies_path = write_cookies(workdir)
+    attempts = ytdlp_attempts()
     errors = []
     for i, proxy in enumerate(attempts, 1):
-        ua = random.choice(user_agents())
-        cmd = ["yt-dlp", "-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-               "--no-playlist", "--no-warnings", "--user-agent", ua]
-        if proxy:
-            cmd += ["--proxy", proxy]
-        if cookies_path:
-            cmd += ["--cookies", cookies_path]
-        cmd += ["--", source_url]
+        ua = pick_user_agent()
+        cmd = ytdlp_base(proxy, ua, cookies_path)
+        cmd += ["-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "--", source_url]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         except subprocess.TimeoutExpired:
