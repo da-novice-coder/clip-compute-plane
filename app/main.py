@@ -24,6 +24,8 @@ app = FastAPI(title="Clip Compute Plane")
 
 MAX_CLIP_SECONDS = float(os.getenv("MAX_CLIP_SECONDS", "180"))
 _render_slots = threading.Semaphore(int(os.getenv("RENDER_CONCURRENCY", "1")))
+# Fewer encoder threads = much lower peak memory (helps on small containers)
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
 
 LEGACY_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36",
@@ -56,8 +58,8 @@ def proxy_pool() -> list[str]:
 
 
 def render_backend() -> str:
-    # RENDER_BACKEND=rendi (default, hosted FFmpeg) or local (FFmpeg inside this container)
-    return os.getenv("RENDER_BACKEND", "rendi").lower()
+    # RENDER_BACKEND=rendi (hosted FFmpeg) or local (default here: FFmpeg inside this container)
+    return os.getenv("RENDER_BACKEND", "local").lower()
 
 
 # ---------- health ----------
@@ -243,6 +245,7 @@ def ffmpeg_args(inputs: list, start: float, duration: float, vf: str, out_name: 
         args += list(input_opts or []) + ["-ss", str(start), "-i", name]
     args += ["-t", str(duration), "-map", "0:v:0", "-map", f"{len(inputs) - 1}:a:0?",
              "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-threads", FFMPEG_THREADS,
              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
              "-movflags", "+faststart", out_name]
     return args
@@ -326,14 +329,18 @@ def render(body: RenderIn):
                 opts += ["-user_agent", ua]
             if proxy:
                 opts += ["-http_proxy", proxy]
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
             cmd += ffmpeg_args(streams, body.start, duration, vf, out, input_opts=opts)
             try:
                 p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             except subprocess.TimeoutExpired:
                 raise HTTPException(status_code=504, detail="render timed out")
             if p.returncode != 0 or not os.path.exists(out):
-                raise HTTPException(status_code=500, detail=f"ffmpeg failed: {p.stderr[-300:]}")
+                # negative return code = FFmpeg was killed by a signal (-9 usually means out of memory)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"ffmpeg failed (exit code {p.returncode}): {p.stderr[-300:]}",
+                )
 
         size = os.path.getsize(out)
         key = f"clips/{uuid.uuid4().hex}.mp4"
