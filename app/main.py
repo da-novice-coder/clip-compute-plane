@@ -27,6 +27,8 @@ MAX_CLIP_SECONDS = float(os.getenv("MAX_CLIP_SECONDS", "180"))
 _render_slots = threading.Semaphore(int(os.getenv("RENDER_CONCURRENCY", "1")))
 # Fewer encoder threads = much lower peak memory (helps on small containers)
 FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
+# Preferred transcript language (ISO 639-1). Requests can override it with "lang".
+TRANSCRIPT_LANG = os.getenv("TRANSCRIPT_LANG", "en").lower()
 
 LEGACY_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/37.0.2062.94 Chrome/37.0.2062.94 Safari/537.36",
@@ -75,9 +77,11 @@ def health():
         "status": "ok",
         "renderBackend": render_backend(),
         "transcriptProviders": os.getenv("TRANSCRIPT_PROVIDER", "native"),
+        "transcriptLang": TRANSCRIPT_LANG,
         "proxies": len(proxy_pool()),
         "uaMode": os.getenv("UA_MODE", "off"),
         "cookies": bool(os.getenv("YOUTUBE_COOKIES")),
+        "captions": True,
     }
 
 
@@ -119,6 +123,8 @@ def ytdlp_base(proxy: str | None, ua: str | None, cookies_path: str | None) -> l
 # ---------- transcript ----------
 class TranscriptIn(BaseModel):
     url: str
+    # Preferred language (ISO 639-1). Defaults to TRANSCRIPT_LANG ("en").
+    lang: str | None = None
 
 
 def video_id_from_url(url: str) -> str:
@@ -139,10 +145,10 @@ def video_id_from_url(url: str) -> str:
     return vid
 
 
-def transcript_native(vid: str) -> dict:
+def transcript_native(vid: str, lang: str) -> dict:
     """Direct YouTube caption fetch (often blocked from datacenter IPs)."""
     try:
-        fetched = YouTubeTranscriptApi().fetch(vid, languages=["en"])
+        fetched = YouTubeTranscriptApi().fetch(vid, languages=[lang])
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"captions unavailable: {type(e).__name__}")
     segments = [
@@ -154,16 +160,20 @@ def transcript_native(vid: str) -> dict:
         for s in fetched
         if s.text.strip()
     ]
-    return {"videoId": vid, "language": fetched.language_code, "segments": segments}
+    return {"videoId": vid, "language": fetched.language_code, "availableLangs": [], "segments": segments}
 
 
-def transcript_supadata(vid: str) -> dict:
-    """Supadata free tier. mode=native = existing captions only (1 credit)."""
+def transcript_supadata(vid: str, lang: str) -> dict:
+    """Supadata free tier. mode=native = existing captions only (1 credit).
+
+    Always sends lang: without it Supadata returns the first available track, which
+    can be a language other than the one spoken in the video.
+    """
     key = os.getenv("SUPADATA_API_KEY", "")
     if not key:
         raise HTTPException(status_code=500, detail="SUPADATA_API_KEY not set")
     q = urllib.parse.urlencode(
-        {"url": f"https://www.youtube.com/watch?v={vid}", "mode": "native"}
+        {"url": f"https://www.youtube.com/watch?v={vid}", "mode": "native", "lang": lang}
     )
     req = urllib.request.Request(
         f"https://api.supadata.ai/v1/transcript?{q}", headers={"x-api-key": key}
@@ -188,7 +198,12 @@ def transcript_supadata(vid: str) -> dict:
         start = float(c.get("offset", 0)) / 1000.0
         end = start + float(c.get("duration", 0)) / 1000.0
         segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
-    return {"videoId": vid, "language": data.get("lang"), "segments": segments}
+    return {
+        "videoId": vid,
+        "language": data.get("lang"),
+        "availableLangs": data.get("availableLangs") or [],
+        "segments": segments,
+    }
 
 
 def parse_json3(path: str) -> list:
@@ -208,7 +223,7 @@ def parse_json3(path: str) -> list:
     return segments
 
 
-def transcript_ytdlp(vid: str) -> dict:
+def transcript_ytdlp(vid: str, lang: str) -> dict:
     """Captions via yt-dlp (no video download) through the proxy pool."""
     url = f"https://www.youtube.com/watch?v={vid}"
     errors = []
@@ -217,7 +232,7 @@ def transcript_ytdlp(vid: str) -> dict:
         for i, proxy in enumerate(ytdlp_attempts(), 1):
             cmd = ytdlp_base(proxy, pick_user_agent(), cookies_path)
             cmd += ["--skip-download", "--write-subs", "--write-auto-subs",
-                    "--sub-langs", "en.*,en", "--sub-format", "json3",
+                    "--sub-langs", f"{lang}.*,{lang}", "--sub-format", "json3",
                     "-o", os.path.join(tmp, "%(id)s.%(ext)s"), "--", url]
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -228,10 +243,10 @@ def transcript_ytdlp(vid: str) -> dict:
             if r.returncode == 0 and files:
                 segments = parse_json3(files[0])
                 if segments:
-                    return {"videoId": vid, "language": "en", "segments": segments}
+                    return {"videoId": vid, "language": lang, "availableLangs": [], "segments": segments}
                 errors.append(f"#{i} empty captions")
                 continue
-            errors.append(f"#{i} {_short_error(r.stderr)}" if r.returncode else f"#{i} no English captions found")
+            errors.append(f"#{i} {_short_error(r.stderr)}" if r.returncode else f"#{i} no '{lang}' captions found")
     raise HTTPException(
         status_code=422,
         detail="yt-dlp captions failed: " + " | ".join(errors),
@@ -248,6 +263,7 @@ PROVIDERS = {
 @app.post("/transcript")
 def transcript(body: TranscriptIn):
     vid = video_id_from_url(body.url)
+    lang = (body.lang or TRANSCRIPT_LANG).strip().lower()
     # TRANSCRIPT_PROVIDER is an ordered, comma-separated fallback chain, e.g. "supadata,ytdlp"
     names = [n.strip().lower() for n in os.getenv("TRANSCRIPT_PROVIDER", "native").split(",") if n.strip()]
     errors = []
@@ -257,10 +273,102 @@ def transcript(body: TranscriptIn):
             errors.append(f"{name}: unknown provider")
             continue
         try:
-            return fn(vid)
+            result = fn(vid, lang)
         except HTTPException as e:
             errors.append(f"{name}: {e.detail}")
+            continue
+        got = (result.get("language") or "").lower()
+        result["requestedLanguage"] = lang
+        # false when the video has no caption track in the requested language
+        result["matchesRequested"] = got.startswith(lang)
+        return result
     raise HTTPException(status_code=422, detail=" || ".join(errors) or "no transcript provider configured")
+
+
+# ---------- captions (burned into the clip) ----------
+class CaptionSeg(BaseModel):
+    # Source-video seconds, the same values /transcript returns
+    start: float
+    end: float
+    text: str
+
+
+def _ass_time(t: float) -> str:
+    cs = int(round(max(0.0, t) * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _split_cue(text: str, limit: int = 40) -> list:
+    chunks, cur = [], ""
+    for word in text.split():
+        if cur and len(cur) + 1 + len(word) > limit:
+            chunks.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def build_ass(captions, clip_start: float, duration: float, w: int, h: int):
+    """ASS subtitle text for the clip, or None when no caption falls inside it.
+
+    Caption times are source-video seconds. They are shifted to clip time, long lines
+    are split, overlaps are removed and exact repeats (rolling auto-captions) are merged.
+    """
+    cues = []
+    for c in sorted(captions, key=lambda c: c.start):
+        text = " ".join(c.text.replace("\n", " ").split())
+        text = text.replace("{", "(").replace("}", ")").replace("\\", "")
+        if not text or c.end <= clip_start or c.start >= clip_start + duration:
+            continue
+        s = max(0.0, c.start - clip_start)
+        e = min(duration, c.end - clip_start)
+        if e - s < 0.05:
+            continue
+        parts = _split_cue(text)
+        total = sum(len(p) for p in parts) or 1
+        t = s
+        for p in parts:
+            d = (e - s) * len(p) / total
+            cues.append([t, t + d, p])
+            t += d
+    cleaned = []
+    for i, (s, e, p) in enumerate(cues):
+        if i + 1 < len(cues):
+            e = min(e, cues[i + 1][0])
+        if e - s < 0.05:
+            continue
+        if cleaned and cleaned[-1][2] == p and s - cleaned[-1][1] < 0.3:
+            cleaned[-1][1] = e
+            continue
+        cleaned.append([s, e, p])
+    if not cleaned:
+        return None
+    font = max(36, round(h * 0.034))
+    outline = max(2, round(h * 0.0025))
+    margin_v = round(h * 0.17)
+    margin_lr = round(w * 0.08)
+    head = (
+        "[Script Info]\nScriptType: v4.00+\n"
+        f"PlayResX: {w}\nPlayResY: {h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,DejaVu Sans,{font},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_lr},{margin_lr},{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    body = "\n".join(
+        f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{p}" for s, e, p in cleaned
+    )
+    return head + body + "\n"
 
 
 # ---------- render ----------
@@ -269,6 +377,8 @@ class RenderIn(BaseModel):
     start: float = Field(ge=0)
     end: float
     format: str = "1080x1920"
+    # Optional: caption lines (source-video seconds). When given, they are burned into the clip.
+    captions: list[CaptionSeg] | None = Field(default=None, max_length=3000)
 
 
 def is_youtube(url: str) -> bool:
@@ -399,11 +509,24 @@ def render(body: RenderIn):
     if duration <= 0 or duration > MAX_CLIP_SECONDS:
         raise HTTPException(status_code=400, detail=f"clip length must be 0-{MAX_CLIP_SECONDS:.0f}s")
 
-    vf = f"crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',scale={w}:{h},setsar=1"
     backend = render_backend()
+    if body.captions and backend == "rendi":
+        raise HTTPException(status_code=400, detail="captions need RENDER_BACKEND=local")
+
+    vf = f"crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})',scale={w}:{h},setsar=1"
     rendi_id = None
+    caption_count = 0
 
     with _render_slots, tempfile.TemporaryDirectory(prefix="render-") as tmp:
+        if body.captions:
+            ass = build_ass(body.captions, body.start, duration, w, h)
+            if ass:
+                ass_path = os.path.join(tmp, "captions.ass")
+                with open(ass_path, "w", encoding="utf-8") as f:
+                    f.write(ass)
+                caption_count = ass.count("\nDialogue:")
+                vf += f",ass={ass_path}"
+
         streams, proxy, ua = resolve_stream_urls(body.sourceUrl, tmp)
         out = os.path.join(tmp, "clip.mp4")
 
@@ -448,4 +571,6 @@ def render(body: RenderIn):
         "end": body.end,
         "backend": backend,
         "rendiCommandId": rendi_id,
+        "captionsBurned": caption_count > 0,
+        "captionCount": caption_count,
     }
